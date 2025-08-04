@@ -7,4 +7,4 @@ In recent years, inflation trends in both the United States and European countri
 
 Given the increasing complexity and regional variation in inflation dynamics, there is an increasing need to explore forecasting approaches that go beyond traditional models. Assuming statics relationships with traditional models may not fully capture the structural changes and hidden processes that drive inflation in different regions over time. In contrast, state-space models offer more flexibility and go beyond the one-size-fits all framework. They allow for more time-varying parameters, unobserved components, and more nuanced modelling of trends, cycles, and other irregular movements.
 
-Disclaimer: Project is still in progress with expected completion in July 2025.
+Disclaimer: Project is still in progress with expected completion in September 2025.
