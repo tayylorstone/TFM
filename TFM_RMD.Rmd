@@ -1,0 +1,891 @@
+---
+title: "TFM"
+author: "Taylor Stone"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+# i. Libraries
+library(zoo)
+library(seasonal)
+library(UComp)
+library(ggplot2)
+library(forecast)
+library(tidyr)
+```
+
+# 1. Read in Data and Prepare
+```{r}
+setwd("/Users/taylorstone/Desktop/TFM")
+raw_data = read.csv("hcpi_data.csv",head=TRUE)
+```
+
+## 1.1 Keep Only Inflation Data and Convert to Time Series
+
+```{r}
+keep_cols = sapply(raw_data, is.numeric)
+keep_cols["Country.Code"] = TRUE  # explicitly keep this column
+data_subset = raw_data[, keep_cols]
+data_subset = data_subset[,-2] #removes IMF.Country.Code
+
+time_data = t(data_subset[,-1])  # transpose so time is rows
+date_index = seq(as.Date("1990-01-01"), by = "month", length.out = nrow(time_data))
+ts_data = zoo((time_data), order.by = date_index) #no log transformation
+colnames(ts_data) = data_subset$Country.Code #set column names as country codes
+```
+
+I decided to use the `zoo` package in R as it is better at handling ordered observations, such as time series data, where dates/times are important. Compared to base R `ts` objects, `zoo` objects offer more flexibility and compatibility with other packages. 
+
+### 1.1.1 Save as New Data File (for GitHub)
+```{r}
+write.csv(ts_data, "Monthly_Inflation_notransform.csv", row.names=FALSE)
+```
+
+## 1.2 Plots
+### 1.2.1 Plot each country
+```{r}
+
+matplot(index(ts_data), coredata(ts_data), type = "l", lty = 1, col = rainbow(ncol(ts_data)),
+        xlab = "Date", ylab = "Value", main = "Monthly Time Series for All Countries")
+legend("topleft", legend = colnames(ts_data), col = rainbow(ncol(ts_data)), lty = 1, cex = 0.4)
+```
+
+### 1.2.2 Plot of G7 Countries
+```{r}
+g7 = c("CAN", "DEU", "FRA", "GBR", "ITA", "JPN", "USA")
+ts_g7 = ts_data[, colnames(ts_data) %in% g7]
+matplot(index(ts_g7), coredata(ts_g7), type = "l", lty = 1, col = rainbow(ncol(ts_g7)),
+        xlab = "Date", ylab = "Value", main = "G7 Monthly Time Series")
+legend("topleft", legend = colnames(ts_g7), col = rainbow(ncol(ts_g7)), lty = 1, cex = 0.5)
+```
+
+## 1.4 Handle Seasonality
+
+### 1.4.1 Loess Method `stl()`
+```{r}
+deseasonalize = function(series) {
+  ts_series = ts(series, start = c(1990, 1), frequency = 12)
+  decomposed = stl(ts_series, s.window = "periodic")
+  return(decomposed$time.series[, "trend"] + decomposed$time.series[, "remainder"])
+}
+
+ts_deseasoned = ts_data  #copy to preserve original
+ts_deseasoned_mat = do.call(cbind, lapply(ts_data, deseasonalize))
+colnames(ts_deseasoned_mat) = colnames(ts_data) #Add back column names
+
+ts_ds_loess= zoo(ts_deseasoned_mat, order.by = index(ts_data))
+```
+
+The function above takes the individual time series of each country and removes the recurring seasonal patters from a time series, leaving behind the trend and any irregular components.
+
+#### 1.4.1.1 Plot Original vs. Deseasonalized by Country (if wanted)
+```{r}
+# (example for CAN)
+plot(index(ts_data), ts_data$CAN, type = "l", col = "blue", main = "Original vs Deseasonalized")
+lines(index(ts_data), ts_ds_loess$CAN, col = "red")
+legend("topleft", legend = c("Original", "Deseasonalized"), col = c("blue", "red"), lty = 1)
+```
+
+#### 1.4.1.2 Plot all Deseasoned Countries
+```{r}
+matplot(index(ts_data), coredata(ts_ds_loess), type = "l", lty = 1, col = rainbow(ncol(ts_ds_loess)),
+        xlab = "Date", ylab = "Value", main = "Deseasoned Monthly Time Series for All Countries")
+legend("topleft", legend = colnames(ts_ds_loess), col = rainbow(ncol(ts_ds_loess)), lty = 1, cex = 0.4)
+```
+
+#### 1.4.1.4 Plot G7 Deseasoned Countries
+```{r}
+
+ts_ds_loess_g7 = ts_ds_loess[, colnames(ts_ds_loess) %in% g7]
+matplot(index(ts_ds_loess_g7), coredata(ts_ds_loess_g7), type = "l", lty = 1, col = rainbow(ncol(ts_ds_loess_g7)),
+        xlab = "Date", ylab = "Value", main = "G7 Deseasoned Monthly Time Series")
+legend("topleft", legend = colnames(ts_ds_loess_g7), col = rainbow(ncol(ts_ds_loess_g7)), lty = 1, cex = 0.5)
+
+```
+
+### 1.4.2 UComp Method
+
+```{r}
+### 1.4.2 UComp Method with For Loop
+
+# Get country names from your time series data
+country_names = colnames(ts_data)
+
+# Initialize empty zoo object to store deseasonalized data
+ts_ds_ucomp = zoo(matrix(NA, nrow = nrow(ts_data), ncol = ncol(ts_data)), 
+                   order.by = index(ts_data))
+colnames(ts_ds_ucomp) = country_names
+
+# Initialize list to store all model results (optional, for accessing individual models later)
+ucomp_models = list()
+
+# Initialize zoo object to store all seasonal components (optional)
+seasonal_components = zoo(matrix(NA, nrow = nrow(ts_data), ncol = ncol(ts_data)), 
+                          order.by = index(ts_data))
+colnames(seasonal_components) = country_names
+
+# Loop through each country
+for(i in 1:length(country_names)) {
+  country = country_names[i]
+  
+  # Extract individual country time series
+  country_ts = ts_data[, country]
+  
+  # Apply UComp to individual country
+  m1 = UC(country_ts, model = "llt/different/arma(0,0)", periods = 12)
+  
+  # Store the model (optional)
+  ucomp_models[[country]] = m1
+  
+  # Extract seasonal component
+  seasonal_zoo = zoo(m1$comp[, "Seasonal"], order.by = index(m1$y))
+  
+  # Store seasonal component
+  seasonal_components[, country] = seasonal_zoo
+  
+  # Calculate deseasonalized series
+  ts_ds_ucomp[, country] = m1$y - seasonal_zoo
+}
+
+```
+
+```{r}
+# Plot seasonal components for all countries
+matplot(index(seasonal_components), coredata(seasonal_components), 
+        type = "l", lty = 1, col = rainbow(ncol(seasonal_components)),
+        xlab = "Date", ylab = "Seasonal Component", 
+        main = "Estimated Seasonal Components for All Countries")
+legend("topleft", legend = colnames(seasonal_components), 
+       col = rainbow(ncol(seasonal_components)), lty = 1, cex = 0.4)
+```
+
+#### 1.4.2.1 Plot Original vs. Deseasonalized by Country (if wanted)
+
+```{r}
+if("MEX" %in% country_names) {
+  plot(index(ts_data), ts_data$MEX, type = "l", col = "blue", 
+       main = "Original vs Deseasonalized - Mexico")
+  lines(index(ts_data), ts_ds_ucomp$MEX, col = "red")
+  legend("topleft", legend = c("Original", "Deseasonalized"), 
+         col = c("blue", "red"), lty = 1)
+}
+
+```
+
+#### 1.4.2.2 Plot of All Deseasoned Countries
+
+```{r}
+matplot(index(ts_data), coredata(ts_ds_ucomp), type = "l", lty = 1, 
+        col = rainbow(ncol(ts_ds_ucomp)),
+        xlab = "Date", ylab = "Value", 
+        main = "Deseasonalized Monthly Time Series for All Countries")
+legend("topleft", legend = colnames(ts_ds_ucomp), 
+       col = rainbow(ncol(ts_ds_ucomp)), lty = 1, cex = 0.4)
+```
+
+#### 1.4.2.3 Deseasoned G7 Countries
+
+```{r}
+ts_ds_ucomp_g7 = ts_ds_ucomp[, colnames(ts_ds_ucomp) %in% g7]
+matplot(index(ts_ds_ucomp_g7), coredata(ts_ds_ucomp_g7), type = "l", lty = 1, 
+        col = rainbow(ncol(ts_ds_ucomp_g7)),
+        xlab = "Date", ylab = "Value", main = "G7 Deseasonalized Monthly Time Series")
+legend("topleft", legend = colnames(ts_ds_ucomp_g7), 
+       col = rainbow(ncol(ts_ds_ucomp_g7)), lty = 1, cex = 0.5)
+```
+
+
+### 1.4.3 XARIMA Method Using `seasonal` Package
+
+```{r}
+deseasonalized_list = list()
+colnames(time_data) = data_subset$Country.Code #set column names as country codes
+
+for (colname in colnames(time_data)) {
+  ts_series = ts((time_data[, colname]), start = c(1990, 1), frequency = 12)
+  m = seas(ts_series)
+  deseasonalized_list[[colname]] = final(m)
+}
+# Combine deseasonalized series into a matrix
+deseasonalized_matrix = do.call(cbind, deseasonalized_list)
+# Optional: convert result to ts object
+#ts_ds_arima = ts(deseasonalized_matrix, start = c(1990, 1), frequency = 12)
+ts_ds_arima = zoo(deseasonalized_matrix, order.by = index(ts_data))
+   
+```
+
+#### 1.4.3.1 Plot Original vs. Deseasonalized by Country (if wanted)
+
+```{r}
+# (example for Japan)
+plot(index(ts_data), ts_data$JPN, type = "l", col = "blue", main = "Original vs Deseasonalized")
+lines(index(ts_data), ts_ds_arima[,"JPN"], col = "red")
+legend("topleft", legend = c("Original", "Deseasonalized"), col = c("blue", "red"), lty = 1)
+```
+
+#### 1.4.3.2 Plot of All Deseasoned Countries
+
+```{r}
+matplot(index(ts_data), coredata(ts_ds_arima), type = "l", lty = 1, col = rainbow(ncol(ts_ds_arima)),
+        xlab = "Date", ylab = "Value", main = "Deseasoned Monthly Time Series for All Countries")
+legend("topleft", legend = colnames(ts_ds_arima), col = rainbow(ncol(ts_ds_arima)), lty = 1, cex = 0.35)
+```
+
+#### 1.4.3.3 Deseasoned G7 Countries
+
+```{r}
+ts_ds_arima_g7 = ts_ds_arima[, colnames(ts_ds_arima) %in% g7]
+matplot(index(ts_ds_arima_g7), coredata(ts_ds_arima_g7), type = "l", lty = 1, col = rainbow(ncol(ts_ds_arima_g7)),
+        xlab = "Date", ylab = "Value", main = "G7 Deseasoned Monthly Time Series")
+legend("topleft", legend = colnames(ts_ds_arima_g7), col = rainbow(ncol(ts_ds_arima_g7)), lty = 1, cex = 0.5)
+```
+
+### 1.4.4 Save Selected Deseasoned Data as new CSV
+
+```{r}
+write.csv(ts_ds_arima, "Monthly_Inflation_Deseasoned.csv", row.names=FALSE)
+```
+
+## 1.5 Inflation Rates
+
+Month-on-month changes in the natural log of the seasonally adjusted CPI:
+$\pi_t = 100 \times log((CPI_t)-log(CPI_{t-1}))$
+
+Annualized Version
+$\pi_t = 12 \times 100 \times log((CPI_t)-log(CPI_{t-1}))$
+
+Year on Year Inflation
+$\pi_t^{YoY} = 100 \times (log(CPI_t)-log(CPI_{t-12}))$
+
+```{r}
+# Year on Year Inflation Rates
+inflation_arima  = diff(log(ts_ds_arima), lag = 12) * 100
+inflation_ucomp  = diff(log(ts_ds_ucomp), lag = 12) * 100
+inflation_loess  = diff(log(ts_ds_loess), lag = 12) * 100
+
+# Adjust date index
+index_adjusted = index(ts_ds_arima)[-c(1:12)]
+inflation_arima = zoo(inflation_arima, order.by = index_adjusted)
+inflation_ucomp = zoo(inflation_ucomp, order.by = index_adjusted)
+inflation_loess = zoo(inflation_loess, order.by = index_adjusted)
+
+#plot each
+
+inflation_ts_loess = zoo(inflation_loess, order.by = index(ts_ds_loess[-1]))
+matplot(index(inflation_ts_loess), coredata(inflation_ts_loess), type = "l", lty = 1, col = rainbow(ncol(inflation_ts_loess)),
+        xlab = "Date", ylab = "Value", main = "Inflation Rates - Loess Method")
+legend("topright", legend = colnames(inflation_loess), col = rainbow(ncol(inflation_ts_loess)), lty = 1, cex = 0.3)
+
+inflation_ts_ucomp = zoo(inflation_ucomp, order.by = index(ts_ds_ucomp[-1]))
+matplot(index(inflation_ts_ucomp), coredata(inflation_ts_ucomp), type = "l", lty = 1, col = rainbow(ncol(inflation_ts_ucomp)),
+        xlab = "Date", ylab = "Value", main = "Inflation Rates - UComp Method")
+legend("topright", legend = colnames(inflation_ts_ucomp), col = rainbow(ncol(inflation_ts_ucomp)), lty = 1, cex = 0.3)
+
+inflation_ts_arima = zoo(inflation_arima, order.by = index(ts_ds_arima[-1]))
+matplot(index(inflation_ts_arima), coredata(inflation_ts_arima), type = "l", lty = 1, col = rainbow(ncol(inflation_ts_arima)),
+        xlab = "Date", ylab = "Value", main = "Year on Year Inflation Rates - ARIMA Method")
+legend("topright", legend = colnames(inflation_ts_arima), col = rainbow(ncol(inflation_ts_arima)), lty = 1, cex = 0.3)
+
+```
+
+## 1.6 Outlier Detection
+
+Following McCracken and Ng (2016), the procedure for detecting outliers, and replacing them, begins with calculating the sample median, $M$ and interquartile range $IR$. Then, we will find observations $x_t$ that satisfy:
+\($|x_t-M|>10 \times IR$\)
+And we will then replace these outliers by:
+\($M+10 \times IR \times \text{sign}(x_t - M)$\)
+
+We will do this for all three methods of deseasonalization. 
+
+```{r}
+source("outlier_detection.R")
+# Original series
+# Example for Poland
+original_series <- inflation_arima$POL  # before handle_outliers
+
+M <- median(original_series, na.rm = TRUE)
+IR <- IQR(original_series, na.rm = TRUE)
+threshold <- 3 * IR  # more standard
+
+deviations <- original_series - M
+outlier_idx <- which(abs(deviations) > threshold)
+
+outlier_idx           # positions
+original_series[outlier_idx]  # values
+
+
+
+# Apply to each series (column) in the deseasonalized ts matrices
+inflation_ucomp_clean = apply(inflation_ucomp, 2, handle_outliers)
+inflation_arima_clean = apply(inflation_arima, 2, handle_outliers)
+inflation_loess_clean = apply(inflation_loess, 2, handle_outliers)
+
+
+
+#plot the outlier and seasonally adjusted time series' by method
+matplot(index(inflation_loess_clean), coredata(inflation_loess_clean), type = "l", lty = 1, col = rainbow(ncol(inflation_loess_clean)),
+        xlab = "Date", ylab = "Value", main = "Outlier and Seasonally Adjusted Time Series - Loess Method")
+legend("topright", legend = colnames(inflation_loess_clean), col = rainbow(ncol(inflation_loess_clean)), lty = 1, cex = 0.3)
+
+matplot(index(inflation_ucomp_clean), coredata(inflation_ucomp_clean), type = "l", lty = 1, col = rainbow(ncol(inflation_ucomp_clean)),
+        xlab = "Date", ylab = "Value", main = "Outlier and Seasonally Adjusted Time Series - UComp Method")
+legend("topright", legend = colnames(inflation_ucomp_clean), col = rainbow(ncol(inflation_ucomp_clean)), lty = 1, cex = 0.3)
+
+matplot(index(inflation_arima_clean), coredata(inflation_arima_clean), type = "l", lty = 1, col = rainbow(ncol(inflation_arima_clean)),
+        xlab = "Date", ylab = "Value", main = "Outlier and Seasonally Adjusted Inflation Rates - ARIMA Method")
+legend("topright", legend = colnames(inflation_arima_clean), col = rainbow(ncol(inflation_arima_clean)), lty = 1, cex = 0.3)
+```
+
+## 1.7 Correlations
+
+```{r}
+#UComp vs. Arima
+cor_arima_ucomp = sapply(1:ncol(inflation_arima), function(i) {
+  cor(inflation_arima[, i], inflation_ucomp[, i], use = "complete.obs")
+})
+names(cor_arima_ucomp) = colnames(inflation_arima)
+
+#UComp vs. Loess
+cor_loess_ucomp = sapply(1:ncol(inflation_loess), function(i) {
+  cor(inflation_loess[, i], inflation_ucomp[, i], use = "complete.obs")
+})
+names(cor_loess_ucomp) = colnames(inflation_loess)
+
+#Arima vs. Loess
+cor_loess_arima = sapply(1:ncol(inflation_loess), function(i) {
+  cor(inflation_loess[, i], inflation_arima[, i], use = "complete.obs")
+})
+names(cor_loess_arima) = colnames(inflation_loess)
+
+```
+
+```{r}
+cor_df = data.frame(
+  country = names(cor_arima_ucomp),
+  arima_ucomp = cor_arima_ucomp,
+  loess_ucomp = cor_loess_ucomp,
+  loess_arima = cor_loess_arima
+)
+
+cor_long = tidyr::pivot_longer(cor_df, cols = -country, names_to = "method_pair", values_to = "correlation")
+
+ggplot(cor_long, aes(x = country, y = correlation, fill = method_pair)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Correlations between Inflation Rate Methods by Country", y = "Correlation", x = "Country")
+
+```
+
+
+Save inflation rates from chosen method.
+```{r}
+inflation_rates = inflation_arima
+write.csv(inflation_arima, "Seasadj_log_inflation_rates.csv", row.names = FALSE)
+```
+
+# 2 Extraction of International Factors (FARS)
+
+## 2.1 FARS Package
+```{r}
+library(FARS) #check to be version 0.5.0
+```
+
+```{r}
+infl_mat = coredata(inflation_rates) #convert selected method to matrix with time as rows and countries as columns
+```
+
+## 2.2 Multilevel Dynamic Factor Model (MLDFM)
+```{r}
+# Ensure data is a matrix (not a zoo object)
+infl_mat = as.matrix(inflation_arima)
+
+#setup
+blocks = 1
+block_ind = rep(ncol(infl_mat), blocks)  # one block with all countries
+
+# Run FARS
+mldfm_res = mldfm(
+  data = infl_mat,
+  blocks = blocks,
+  block_ind = block_ind,
+  global = 1,
+  local = NULL,
+  method = 1
+)
+
+# Check the structure of the result
+str(mldfm_res)
+names(mldfm_res)
+
+# Check if the estimation was successful
+print(mldfm_res)
+```
+
+The MLDFM successfully estimated one global factor across 26 countries over 396 time periods (33 years, 1990-2023), the global factor represents the common components driving inflation across all countries.
+
+Key Components are as follows:
+### 2.2.1 Factors (Global Factor)
+```{r}
+global_factor = mldfm_res$Factors[, 1]*(-1)  # Extract the global factor and multiply by -1
+
+# Plot the global factor over time
+dates = as.Date(rownames(mldfm_res$Residuals))
+plot(dates, global_factor, type = 'l', 
+     main = "Global Inflation Factor", 
+     xlab = "Time", ylab = "Global Factor",
+     lwd = 2, col = "cornflowerblue")
+```
+
+### 2.2.2 Lambda (Factor Loadings)
+```{r}
+factor_loadings = mldfm_res$Lambda[, 1]*(-1) # we have to multiply this by -1 as we multiplied the Factors by -1 already
+names(factor_loadings) = colnames(mldfm_res$Residuals)
+print(factor_loadings)
+
+# Plot loadings to see which countries are most influenced by global factor
+barplot(sort(factor_loadings), horiz = TRUE, las = 1,
+        main = "Country Loadings on Global Factor",
+        xlab = "Loading Coefficient")
+```
+
+The higher absolute loadings indicate the countries inflation is more susceptible/influenced by global trends. Negative loadings indicate the country moves opposite of the global factor. 
+
+# 3 Models
+```{r}
+#separate US data for primary model construction
+us_infl = inflation_arima[,"USA"]
+```
+
+
+## 3.1 Traditional ARIMA
+
+To fit an ARIMA model to any input numeric vector of a univariate time series, I have created the function `fit_arima`. First, it converts the vector into a time series object with a specified frequency, start, and end date, which are consistent throughout all of our series, then, it automatically selects the best ARIMA model using `auto.arima()` from the `forecast` package, searching over both seasonal and non-seasonal components. The functions stores the fitted values to a new object that we can use later to compare. 
+
+For diagnostics, the function also prints four plots: the original time series, the Fitted vs. Actual to compare the behavior of the model versus the original, a plot of the residuals to determine if there are any patterns or violations of the assumptions (e.g., non-constant variance or autocorrelation), and an ACF plot to check for remaining autocorrelation in the residuals. 
+```{r}
+
+source("fit_arima.R")
+fit_arima(us_infl)
+```
+
+## 3.2 ARIMA with Factors
+```{r}
+source("fit_arima.R")
+fit_arima_gif(us_infl, global_factor)
+```
+
+
+## 3.3 State Space Model: Unobserved Components - Stochastic Volatility with Autoregressive Term
+
+We will focus on creating an Unobserved Components - Stochastic Volatility, or UCSV, model to model inflation where the underlying components are not directly observable but are inferred through the model. Generally, it can be broken down into two parts: the trend (unobserved component) and the time-varying (stochastic) volatility (noise). This model was first introduced and applied by Stock and Watson to explain how U.S. inflation became more stable over time, and what caused the stability.
+
+The structure is as follows:
+$\pi_t = \mu_t+c_t+\epsilon_t, \epsilon_t\sim\mathcal{N}(0,\sigma_t^2)$
+
+Where
+
+$\mu_t = \mu_{t-1}+\eta_t, \eta_t\sim\mathcal{N}(0, \omega_\mu^2)$ is random walk trend equation that evolves slowly overtime.
+
+hh
+
+The function provided by *Statistical Modeling and Computation* by J.C.C. Chan and D.P. Kroese (2nd ed., 2025), altered to fit our data, estimates the Unobserved Components Stochastic Volatility (UCSV) model for a given time series. The original model, introduced by Stock and Watson, decomposes a series into a slowly evolving trend component, a cyclical AR(1) component, and a stochastic volatility term.
+
+The function works as follows:
+- **Preparation:** Formats the input series into the correct structure for estimation.
+- **Initialization:** Sets priors and initial values for the state variables, AR term, and volatility.
+- **Estimation:** Uses a Gibbs sampler with forward-filtering backward-sampling (FFBS) to simulate the latent states and draw from the posterior distributions.
+- **Outputs:** Three plots, one to demonstrate the behavior of the estimated trend (tau), one to plot both the trend and the original plot, and another to show the estimated stochastic volatility (hhat).
+
+```{r}
+#with AR
+source("UCSV.r")
+fit_ucsv(us_infl)
+
+```
+
+## 3.4 State Space Model + Auto-Regression (AR) Component with Factors
+
+When we include the Global Inflation Factor (GIF) as an exogenous variable, the equation becomes
+
+$\pi_t = \mu_t+c_t+GIF_t + \epsilon_t, \epsilon_t\sim\mathcal{N}(0,\sigma_t^2)$
+
+We will not be using the individual factor loadings, denoted $\lambda$, as it would convert our model into a multivariate state space model, and we are not computing that.
+
+```{r}
+usa_loading = factor_loadings["USA"]
+
+#with AR
+source("UCSV.R")
+fit_ucsv_gif(us_infl, global_factor)
+```
+
+## 3.5 G7 Countries Model Formulations
+
+The following code runs a for-loop for each function (shown previously) where we will only analyze the G7 countries. Each loop ccalls the individual function, then stores the predicted values in a new matrix, retaining the country names, and allowing us to compare the original values to the fitted ones.
+```{r}
+# Step 1: Create a matrix of only the G7 Countries (Canada, France, Germany, Italy, Japan, the United Kingdom, and the United States)
+g7_countries = c("CAN", "DEU", "FRA", "GBR", "ITA", "JPN", "USA")
+data_g7 = inflation_arima[, g7_countries]
+
+# Retain the Column Names as the country names and row names as dates
+og_cols = colnames(data_g7)
+og_rows = rownames(data_g7)
+
+n_countries = ncol(data_g7)
+n_time = nrow(data_g7)
+
+# Step 2: Make sure the global factor is stored properly
+global_factor_mat = matrix(global_factor, nrow = n_time, ncol = n_countries)
+colnames(global_factor_mat) = g7_countries
+rownames(global_factor_mat) = rownames(data_g7)
+
+head(global_factor_mat)
+
+# Step 3: Model Formulations
+# 0. Initialize Emptry Matrices for Each Model
+fitted_ar = fitted_ar_gif = fitted_ucsv = fitted_ucsv_gif = 
+  matrix(NA, nrow = n_time, ncol = n_countries)
+colnames(fitted_ar) = colnames(fitted_ar_gif) = colnames(fitted_ucsv) = colnames(fitted_ucsv_gif) = g7_countries
+rownames(fitted_ar) = rownames(fitted_ar_gif) = rownames(fitted_ucsv) = rownames(fitted_ucsv_gif) = rownames(data_g7)
+
+# Initialize a matrix for the arima orders as well
+orders_ar      = matrix(NA, nrow = n_countries, ncol = 6,
+                         dimnames = list(colnames(data_g7),
+                                         c("p","d","q","P","D","Q")))
+orders_ar_gif = matrix(NA, nrow=n_countries, ncol=6,
+                       dimnames = list(colnames(data_g7),
+                                       c("p","d","q","P","D","Q")))
+
+
+#initialize UCSV parameter storage
+params_ucsv = matrix(NA, 
+                     nrow = n_countries, 
+                     ncol = 3, 
+                     dimnames = list(colnames(data_g7),
+                                     c("Omega2Tau","Omega2H","Phi")))
+params_ucsv_gif = matrix(NA, 
+                         nrow = n_countries, 
+                         ncol = 4, 
+                         dimnames = list(colnames(data_g7),
+                                         c("Omega2Tau","Omega2H","Phi","Beta")))
+
+
+# 1. ARIMA
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = colnames(data_g7)[i]   # Get the name of current country to print
+  cat("\n ARIMA Model for", country)
+  
+  result = fit_arima(y)
+  fitted_ar[, i] = result$fitted_values
+  # Extract ARIMA order
+  ord = arimaorder(result$model)
+  orders_ar[i, ] = c(ord["p"], ord["d"], ord["q"],
+                      ord["P"], ord["D"], ord["Q"])
+}
+
+# Turn into a nice data.frame
+orders_ar_df = as.data.frame(orders_ar)
+orders_ar_df$Country = rownames(orders_ar_df)
+orders_ar_df = orders_ar_df[, c("Country","p","d","q","P","D","Q")]
+
+print(orders_ar_df)
+
+# 2. ARIMA with Global Factors
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  gf = global_factor_mat[, i]
+  country = colnames(data_g7)[i]   # Get the name of current country to print
+  cat("\n ARIMA Model with Global Inflation Factors for", country)
+  result = fit_arima_gif(y, gf)
+  fitted_ar_gif[, i] = result$fitted_values
+  # Extract ARIMA order
+  ord = arimaorder(result$model)
+  orders_ar_gif[i, ] = c(ord["p"], ord["d"], ord["q"],
+                      ord["P"], ord["D"], ord["Q"])
+}
+
+# Turn into a nice data.frame
+orders_arg_df = as.data.frame(orders_ar_gif)
+orders_arg_df$Country = rownames(orders_arg_df)
+orders_arg_df = orders_arg_df[, c("Country","p","d","q","P","D","Q")]
+
+print(orders_arg_df)
+
+source("UCSV.R")
+# 3. UCSV
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = colnames(data_g7)[i]
+  
+  result = fit_ucsv(y)
+  fitted_ucsv[, i] = result$fitted_values
+  
+  params_ucsv[country, ] <- c(result$omega2tau, result$omega2h, result$phihat)
+}
+
+# 4. UCSV + GIF
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = colnames(data_g7)[i]
+  
+  gf = global_factor_mat[, i]
+  result = fit_ucsv_gif(y, gf)
+  fitted_ucsv_gif[, i] = result$fitted_values
+  
+  params_ucsv_gif[country, ] <- c(result$omega2tau, result$omega2h, result$phihat, result$betahat)
+}
+
+
+```
+
+```{r}
+#Calculate RMSE for United States
+# actual data
+y <- us_infl
+
+# compute RMSE helper
+rmse <- function(actual, fitted) {
+  sqrt(mean((actual - fitted)^2, na.rm = TRUE))
+}
+
+# calculate RMSE for each fitted model
+rmse_results <- data.frame(
+  Model = c("AR", "AR + GIF", "UCSV", "UCSV + GIF"),
+  RMSE  = c(
+    rmse(y, fitted_ar),
+    rmse(y, fitted_ar_gif),
+    rmse(y, fitted_ucsv),
+    rmse(y, fitted_ucsv_gif)
+  )
+)
+
+# print table
+print(rmse_results)
+sd(us_infl)
+
+
+compute_rmse = function(fitted_mat, actual_mat) {
+  errors = fitted_mat - actual_mat
+  rmse = sqrt(colMeans(errors^2, na.rm = TRUE))
+}
+rmse_ar = compute_rmse(fitted_ar, data_g7)
+rmse_ar_gif = compute_rmse(fitted_ar_gif, data_g7)
+rmse_ucsv = compute_rmse(fitted_ucsv, data_g7)
+rmse_ucsv_gif = compute_rmse(fitted_ucsv_gif, data_g7)
+
+mean(rmse_ar)
+mean(rmse_ar_gif)
+mean(rmse_ucsv)
+mean(rmse_ucsv_gif)
+```
+
+
+# 4 Forecast Evaluation
+```{r}
+ # time series schemes: rolling window, expanding window, Diebold-Mariano (dm.test) test, multiple-forecasting-testing, Spec test
+```
+
+## 4.1 Time Series Cross Validation
+From ~Forecasting: Principles and Practice~ Section 5.10, time series cross-validation consists of making a sequence of forecasts using an incrementally expanding training sets. 
+
+```{r}
+#Single Country Testing
+source("TSCV.R")
+#normal arima
+forecast_arima(us_infl)
+#arima+gif
+forecast_arima_gif(us_infl, global_factor)
+#UCSV
+forecast_ucsv(us_infl)
+#UCSV+gif
+forecast_ucsv_gif(us_infl, global_factor)
+```
+
+```{r}
+###### Obtain Forecasts #####
+# Step 0: Set Up
+g7_countries = c("CAN", "DEU", "FRA", "GBR", "ITA", "JPN", "USA")
+data_g7 = inflation_arima[, g7_countries]
+
+n_countries = ncol(data_g7)
+forecast_time = (2023 - 2005 + 1) * 12  # 228 months
+
+# Get only the OOS rownames
+dates_oos = rownames(data_g7)[(nrow(data_g7) - forecast_time + 1):nrow(data_g7)]
+
+# Initialize empty matrix for forecasts
+forecasted_ar = forecasted_ar_gif = forecasted_ucsv = forecasted_ucsv_gif = 
+  matrix(NA, nrow = forecast_time, ncol = n_countries)
+colnames(forecasted_ar) = colnames(forecasted_ar_gif) = colnames(forecasted_ucsv) = colnames(forecasted_ucsv_gif) = g7_countries
+rownames(forecasted_ar) = rownames(forecasted_ar_gif) = rownames(forecasted_ucsv) = rownames(forecasted_ucsv_gif) = dates_oos
+
+source("TSCV.R")
+# 1. ARIMA
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = colnames(data_g7)[i]
+  cat("\nARIMA Rolling Window Forecasts for", country, "\n")
+  
+  result = forecast_arima(y)   # must return vector of length forecast_time
+  forecasted_ar[, i] = result
+}
+plot_forecasts(forecasted_ar, "ARIMA")
+
+
+# 2. ARIMA + GIF
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = colnames(data_g7)[i]
+  gf = global_factor_mat[, i]
+  cat("\nARIMA with Global Inflation Factor Rolling Window Forecasts for", country, "\n")
+  
+  result = forecast_arima_gif(y, gf)
+  forecasted_ar_gif[, i] = result
+}
+plot_forecasts(forecasted_ar_gif, "ARIMA + GIF")
+
+
+# 3. UCSVAR
+# Loop through G7
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = g7_countries[i]
+  cat("\nUCSV Rolling Window Forecasts for", country, "\n")
+  
+  forecasted_ucsv[, i] = forecast_ucsv(y)
+}
+plot_forecasts(forecasted_ucsv, "UCSV")
+
+# 4. UCSVAR + GIF
+for (i in 1:n_countries) {
+  y = data_g7[, i]
+  country = g7_countries[i]
+  gf = global_factor_mat[, i]
+  cat("\nUCSV with GIF Rolling Window Forecasts for", country, "\n")
+  
+  forecasted_ucsv_gif[, i] = forecast_ucsv_gif(y,gf)
+}
+plot_forecasts(forecasted_ucsv_gif, "UCSV + GIF")
+```
+
+
+```{r}
+# save each forecasting matrix as a csv file
+write.csv(forecasted_ar, "forecasted_ar", row.names = FALSE)
+
+write.csv(forecasted_ar_gif, "forecasted_ar_gif")
+write.csv(forecasted_ucsv, "forecasted_ucsv")
+write.csv(forecasted_ucsv_gif, "forecasted_ucsv_gif")
+```
+
+```{r}
+##### Cross Validation #####
+source("TSCV.R")
+# 1. Obtain original data set values for the forecasted dates
+original_values = data_g7[dates_oos, ]
+
+# 2. Function to calculate RMSE
+compute_rmse = function(forecast_mat, actual_mat) {
+  errors = forecast_mat - actual_mat
+  rmse = sqrt(colMeans(errors^2, na.rm = TRUE))
+}
+
+# 3. Calculate RMSE for each method
+errors_ar = compute_errors(forecasted_ar, original_values)
+errors_ar_gif = compute_errors(forecasted_ar_gif, original_values)
+errors_ucsv = compute_errors(forecasted_ucsv, original_values)
+errors_ucsv_gif = compute_errors(forecasted_ucsv_gif, original_values)
+
+# 4. Summarize Result
+mean(errors_ar$rmse)       
+mean(errors_ar_gif$rmse)   
+mean(errors_ucsv$rmse)     
+mean(errors_ucsv_gif$rmse)
+```
+
+
+## Multiple Forecasting Testing: Diebold-Mariano Test
+```{r}
+# Diebold-Mariano (dm.test) test
+source("DM_test.R")
+dim(original_values)
+dm_results_CAN = dm_test2("CAN", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+dm_results_FRA = dm_test2("FRA", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+dm_results_DEU = dm_test2("DEU", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+dm_results_ITA = dm_test2("ITA", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+dm_results_JPN = dm_test2("JPN", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+dm_results_GBR = dm_test2("GBR", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+dm_results_USA = dm_test2("USA", original_values, forecasted_ar = forecasted_ar, forecasted_ar_gif = forecasted_ar_gif, forecasted_ucsv = forecasted_ucsv, forecasted_ucsv_gif = forecasted_ucsv_gif)
+
+
+
+
+```
+
+```{r}
+#significance
+significance = function(p) {
+  if (p < 0.001) return("***")
+  else if (p < 0.01) return("**")
+  else if (p < 0.05) return("*")
+  else if (p < 0.1) return(".")
+  else return("")
+}
+
+#re-list of country codes
+g7_countries = c("CAN", "DEU", "FRA", "GBR", "ITA", "JPN", "USA")
+
+#collect results for all countries
+dm_results = do.call(rbind, lapply(g7_countries, function(ctry) {
+  results = dm_test2(ctry,
+                     original_values,
+                     forecasted_ar = forecasted_ar,
+                     forecasted_ar_gif = forecasted_ar_gif,
+                     forecasted_ucsv = forecasted_ucsv,
+                     forecasted_ucsv_gif = forecasted_ucsv_gif)
+  results$Sig = sapply(results$p_value, significance) #significance
+  
+  #rounding
+  results$DM_stat = round(results$DM_stat, 3)
+  results$p_value = round(results$p_value, 3)
+  
+  results
+}))
+
+
+#print table
+print(dm_results)
+
+```
+## Multiple Forecasting Testing: Multiple Panel Tests
+```{r}
+panel_results <- panel_test_fixed(
+  original_values, 
+  forecasted_ar, 
+  forecasted_ar_gif, 
+  forecasted_ucsv, 
+  forecasted_ucsv_gif
+)
+# Format results like Table 12
+panel_table12 <- panel_results[, c("Model1", "Model2", "S1_stat", "S1_pval", "S3_stat", "S3_pval")]
+panel_table12$n_T <- paste(nrow(original_values), ncol(original_values), sep=",")
+
+#Rename columns to match Table 12 style from paper
+names(panel_table12) <- c("Model1", "Model2", "S1 Statistic", "S1 p-value", "S3 Statistic", "S3 p-value", "n,T")
+
+panel_table12
+```
+
+
+
